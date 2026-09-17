@@ -94,6 +94,11 @@ class SplatModel(nn.Module):
         self._grad_count = 0
         self._view_ctx: dict = {}
         self._generator: Optional[torch.Generator] = None
+        # diagnostics accumulators (see ``record_step_stats`` / ``diagnostics``)
+        self._diag_grad_zero = 0
+        self._diag_grad_total = 0
+        self._diag_cov_sum = 0.0
+        self._diag_cov_count = 0
 
     # ---- required properties -----------------------------------------
     @property
@@ -214,6 +219,55 @@ class SplatModel(nn.Module):
         if self._grad_accum is None:
             return None
         return self._grad_accum / max(1, self._grad_count)
+
+    # ---- training diagnostics ----------------------------------------
+    def _diagnostic_param_name(self) -> Optional[str]:
+        """Parameter whose per-primitive gradient is tracked for diagnostics."""
+        return None
+
+    def record_step_stats(self, render_out=None) -> None:
+        """Accumulate per-step training health stats after ``backward()``."""
+        if not getattr(self._cfg, "collect_diagnostics", False):
+            return
+        name = self._diagnostic_param_name()
+        if name is not None and name in self.p and self.p[name].grad is not None:
+            g = self.p[name].grad.detach()
+            gn = g.reshape(g.shape[0], -1).norm(dim=1)
+            self._diag_grad_zero += int((gn < 1e-12).sum())
+            self._diag_grad_total += int(gn.numel())
+        if render_out is not None and render_out.weights is not None:
+            w = render_out.weights.detach()
+            n = w.shape[0]
+            if n:
+                contributed = (w.max(dim=1).values > 1e-5).float().mean().item()
+                self._diag_cov_sum += contributed
+                self._diag_cov_count += 1
+
+    def _common_diagnostics(self) -> dict:
+        total = max(1, self._diag_grad_total)
+        return {
+            "zero_grad_frac": self._diag_grad_zero / total,
+            "coverage_frac": (self._diag_cov_sum / self._diag_cov_count) if self._diag_cov_count else None,
+            "n_primitives": int(self.num_primitives),
+        }
+
+    def _reset_diagnostics(self) -> None:
+        self._diag_grad_zero = 0
+        self._diag_grad_total = 0
+        self._diag_cov_sum = 0.0
+        self._diag_cov_count = 0
+
+    def diagnostics(self) -> dict:
+        """Finalize and reset per-interval diagnostics (called at checkpoints)."""
+        if not getattr(self._cfg, "collect_diagnostics", False):
+            return {}
+        out = self._common_diagnostics()
+        out.update(self._extra_diagnostics())
+        self._reset_diagnostics()
+        return out
+
+    def _extra_diagnostics(self) -> dict:
+        return {}
 
     # ---- densification hooks -----------------------------------------
     def densify(self, iteration: int) -> None:

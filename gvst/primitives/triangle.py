@@ -79,6 +79,52 @@ class TriangleModel(SplatModel):
         cross = torch.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0], dim=1)
         return 0.5 * cross.norm(dim=1)
 
+    def triangle_quality(self) -> dict:
+        """Per-triangle shape statistics used to detect degenerate geometry."""
+        v = self.p["vertices"]
+        e0 = (v[:, 1] - v[:, 0]).norm(dim=1)
+        e1 = (v[:, 2] - v[:, 1]).norm(dim=1)
+        e2 = (v[:, 0] - v[:, 2]).norm(dim=1)
+        edges = torch.stack([e0, e1, e2], dim=1)
+        longest = edges.max(dim=1).values
+        area = self.triangle_area()
+        semi = edges.sum(dim=1) * 0.5
+        inradius = area / semi.clamp_min(1e-12)
+        aspect = longest / (2.0 * inradius).clamp_min(1e-12)
+        # minimum interior angle via the law of cosines
+        ang = []
+        for i in range(3):
+            a = v[:, (i + 1) % 3] - v[:, i]
+            b = v[:, (i + 2) % 3] - v[:, i]
+            cos = (a * b).sum(-1) / (a.norm(dim=1) * b.norm(dim=1)).clamp_min(1e-12)
+            ang.append(torch.acos(cos.clamp(-1.0, 1.0)))
+        min_angle = torch.stack(ang, dim=1).min(dim=1).values
+        return {"area": area, "aspect": aspect, "min_angle": min_angle}
+
+    # ---- training diagnostics ----------------------------------------
+    def _diagnostic_param_name(self) -> str:
+        return "vertices"
+
+    def _extra_diagnostics(self) -> dict:
+        with torch.no_grad():
+            q = self.triangle_quality()
+            area, aspect, ang = q["area"], q["aspect"], q["min_angle"]
+            area_eps = (1e-3 * float(self.scene_extent)) ** 2
+            op = self.opacity
+            sig = self.sigma()
+            return {
+                "area_mean": float(area.mean()),
+                "area_min": float(area.min()),
+                "degenerate_frac": float((area < max(area_eps, 1e-10)).float().mean()),
+                "sliver_frac": float((aspect > 15.0).float().mean()),
+                "min_angle_mean_deg": float(ang.mean()) * 180.0 / 3.141592653589793,
+                "sharp_frac": float((ang < 0.0174533).float().mean()),
+                "aspect_mean": float(aspect.mean()),
+                "opacity_mean": float(op.mean()),
+                "opacity_p10": float(op.quantile(0.1)),
+                "sigma_mean": float(sig.mean()),
+            }
+
     # ---- rendering ----------------------------------------------------
     def start_view(self, camera) -> None:
         verts = self.p["vertices"]
@@ -204,6 +250,8 @@ class TriangleModel(SplatModel):
         cfg = self._cfg
         if self._stats is None or self.optimizer is None:
             return
+        if cfg.tri_densify_mode == "none":
+            return
         interval = cfg.tri_densification_interval
         if interval <= 0 or iteration % interval != 0:
             return
@@ -227,7 +275,11 @@ class TriangleModel(SplatModel):
             probs = probs.masked_fill(dead, 0.0).clamp_min(0.0)
             nz = int((probs > 0).sum())
             if nz:
-                sel = torch.multinomial(probs, min(num_add, nz), replacement=False)
+                k = min(num_add, nz)
+                if cfg.tri_densify_mode == "deterministic":
+                    sel = torch.topk(probs, k).indices
+                else:
+                    sel = torch.multinomial(probs, k, replacement=False)
             else:
                 sel = torch.empty(0, dtype=torch.long, device=probs.device)
             if sel.numel() and self._stats["image_size"][sel].numel():
@@ -286,6 +338,10 @@ class TriangleModel(SplatModel):
 
     def prune_final(self) -> None:
         if self._stats is None or self.optimizer is None:
+            return
+        if self._cfg.tri_densify_mode == "none":
+            # ablation: no growth and no pruning, so the initialisation is kept
+            self._stats = None
             return
         dead = self._dead_mask(self._cfg.iterations)
         if dead.any():

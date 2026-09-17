@@ -72,6 +72,24 @@ class Gaussian3D(SplatModel):
         M = R * S[:, None, :]
         return M @ M.transpose(1, 2)
 
+    # ---- training diagnostics ----------------------------------------
+    def _diagnostic_param_name(self) -> str:
+        return "means"
+
+    def _extra_diagnostics(self) -> dict:
+        with torch.no_grad():
+            s = self.scale()
+            s_max = s.max(dim=1).values
+            op = self.opacity
+            return {
+                "scale_min": float(s.min()),
+                "scale_max": float(s_max.max()),
+                "scale_mean": float(s_max.mean()),
+                "tiny_frac": float((s_max < 1e-3).float().mean()),
+                "opacity_mean": float(op.mean()),
+                "opacity_p10": float(op.quantile(0.1)),
+            }
+
     # ---- rendering ----------------------------------------------------
     def start_view(self, camera) -> None:
         ctx = {}

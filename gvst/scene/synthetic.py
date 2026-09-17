@@ -108,6 +108,14 @@ class Quad(Shape):
         self._n = self._n.to(device)
         return self
 
+    def sample(self, n: int, generator: torch.Generator | None = None, device=None) -> dict:
+        """Uniform surface samples ``(points, normals, albedo)`` on the quad."""
+        device = self.p0.device if device is None else device
+        uv = torch.rand(n, 2, generator=generator, device="cpu").to(device)
+        points = self.p0 + uv[:, 0:1] * self.e1 + uv[:, 1:2] * self.e2
+        normals = self._n.unsqueeze(0).expand(n, 3).clone()
+        return {"points": points, "normals": normals, "albedo": self.texture(uv)}
+
     def intersect(self, origins: Tensor, dirs: Tensor) -> Hit:
         n = self._n
         denom = dirs @ n
@@ -142,6 +150,17 @@ class Sphere(Shape):
     def to(self, device) -> "Sphere":
         self.center = self.center.to(device)
         return self
+
+    def sample(self, n: int, generator: torch.Generator | None = None, device=None) -> dict:
+        """Uniform surface samples ``(points, normals, albedo)`` on the sphere."""
+        device = self.center.device if device is None else device
+        d = torch.randn(n, 3, generator=generator, device="cpu").to(device)
+        d = d / d.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        points = self.center + self.radius * d
+        u = torch.atan2(points[..., 2] - self.center[2], points[..., 0] - self.center[0]) / (2 * torch.pi) + 0.5
+        v = torch.acos((points[..., 1] - self.center[1]).div(self.radius).clamp(-1, 1)) / torch.pi
+        uv = torch.stack([u, v], dim=-1)
+        return {"points": points, "normals": d, "albedo": self.texture(uv)}
 
     def intersect(self, origins: Tensor, dirs: Tensor) -> Hit:
         oc = origins - self.center  # broadcasts: [3] or [P,3]
@@ -292,6 +311,20 @@ class Scene:
         center = c.mean(0)
         return float((c - center).norm(dim=-1).max()) * 1.1
 
+    def sample_surface(self, n: int = 20_000, seed: int = 0) -> dict:
+        """Analytic ground-truth surface samples for geometry metrics.
+
+        Samples are spread evenly over the scene's shapes; ``points [n,3]``,
+        ``normals [n,3]`` (unit, outward) and ``albedo [n,3]`` are returned.
+        Because the shapes are analytic this is a noise-free reference surface
+        rather than a depth-map back-projection.
+        """
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        base, rem = divmod(n, max(1, len(self.shapes)))
+        counts = [base + (1 if i < rem else 0) for i in range(len(self.shapes))]
+        parts = [s.sample(c, generator=gen, device=self._device) for s, c in zip(self.shapes, counts) if c > 0]
+        return {k: torch.cat([p[k] for p in parts], dim=0) for k in ("points", "normals", "albedo")}
+
 
 # ---------------------------------------------------------------------------
 # concrete scenes
@@ -372,7 +405,65 @@ def make_scene(name: str, seed: int = 0) -> Scene:
             camera_radius=3.2,
             elevations_deg=(15.0, 27.0, 40.0),
         )
+    if name == "intersect":
+        tex_xy = lambda uv: checker(uv, 6.0, (0.9, 0.25, 0.2), (0.15, 0.5, 0.9))
+        tex_yz = lambda uv: checker(uv, 5.0, (0.95, 0.85, 0.2), (0.2, 0.7, 0.4))
+        tex_xz = lambda uv: high_freq(uv, freq=18.0).expand(-1, 3)
+        q_xy = Quad((-1.0, -1.0, 0.0), (2.0, 0, 0), (0, 2.0, 0), tex_xy, double_sided=True)
+        q_yz = Quad((0.0, -1.0, -1.0), (0, 2.0, 0), (0, 0, 2.0), tex_yz, double_sided=True)
+        q_xz = Quad((-1.0, 0.0, -1.0), (2.0, 0, 0), (0, 0, 2.0), tex_xz, double_sided=True)
+        return Scene(
+            name="intersect",
+            description=(
+                "Three mutually intersecting (not just adjacent) double-sided sheets "
+                "passing through the origin.  Tests depth ordering under interpenetration: "
+                "a single front-to-back sort by primitive centre is not a valid ordering "
+                "where triangles cross, so transmittance and gradients are corrupted."
+            ),
+            shapes=[q_xy, q_yz, q_xz],
+            background=(0.05, 0.05, 0.07),
+            target=(0.0, 0.0, 0.0),
+            camera_radius=3.2,
+            elevations_deg=(15.0, 30.0, 45.0),
+        )
+    if name == "hf":
+        tex = lambda uv: (
+            checker(uv, 22.0, (0.95, 0.95, 0.95), (0.05, 0.05, 0.05)) * 0.6
+            + high_freq(uv, freq=40.0) * 0.4
+        )
+        q = Quad((-1.6, -1.0, -1.6), (0, 0, 3.2), (3.2, 0, 0), tex)
+        return Scene(
+            name="hf",
+            description=(
+                "A high-frequency textured plane (checker + sinusoidal detail close to the "
+                "training Nyquist).  Tests anti-aliasing and resolution scaling: primitives "
+                "with hard windows can alias and must densify aggressively to resolve detail."
+            ),
+            shapes=[q],
+            background=(0.4, 0.5, 0.7),
+            target=(0.0, -1.0, 0.0),
+            camera_radius=3.0,
+            elevations_deg=(20.0, 32.0, 45.0),
+        )
+    if name == "solid":
+        solid_tex = lambda uv: torch.tensor([0.55, 0.55, 0.58], device=uv.device, dtype=uv.dtype).expand(*uv.shape[:-1], 3)
+        s = Sphere((0.0, 0.0, 0.0), 1.0, solid_tex)
+        floor = Quad((-1.8, -1.0, -1.8), (0, 0, 3.6), (3.6, 0, 0), lambda uv: torch.full_like(uv[..., :1], 0.25).expand(-1, 3))
+        return Scene(
+            name="solid",
+            description=(
+                "Textureless geometry: a constant-albedo sphere over a constant-albedo "
+                "floor.  Without texture the photometric loss constrains only shading and "
+                "silhouettes, so it isolates how well a primitive recovers pure geometry "
+                "instead of fitting colour."
+            ),
+            shapes=[s, floor],
+            background=(0.3, 0.35, 0.45),
+            target=(0.0, 0.0, 0.0),
+            camera_radius=3.2,
+            elevations_deg=(15.0, 28.0, 40.0),
+        )
     raise KeyError(f"unknown scene {name!r}")
 
 
-SCENES = ("plane", "sphere", "corner", "sheets")
+SCENES = ("plane", "sphere", "corner", "sheets", "intersect", "hf", "solid")

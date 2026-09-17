@@ -47,6 +47,14 @@ class FoldResult:
     seed: int = 0
     image_size: int = 0
     train_views: list = field(default_factory=list)
+    # geometry metrics (Chamfer / F-score / normal consistency); ``soup`` is the
+    # explicit triangle-soup extraction, the others are rendered-depth clouds.
+    geom_chamfer: Optional[float] = None
+    geom_fscore: Optional[float] = None
+    geom_normal_consistency: Optional[float] = None
+    geom_soup_chamfer: Optional[float] = None
+    geom_soup_fscore: Optional[float] = None
+    geom_soup_normal_consistency: Optional[float] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -76,6 +84,7 @@ def run_fold(
     log: bool = False,
     save_dir: Optional[str] = None,
     train_indices: Optional[list] = None,
+    compute_geometry: bool = False,
 ) -> FoldResult:
     """Train on the given training views and evaluate on ``held_out``."""
     scene = make_scene(scene_name, seed=spec.seed).to(device)
@@ -151,6 +160,17 @@ def run_fold(
         train_views=train_idx,
     )
 
+    if compute_geometry:
+        from .geometry import geometry_for_model
+
+        gt_cloud = scene.sample_surface(20_000, seed=spec.seed)
+        gt_cloud = {k: v.to(device) for k, v in gt_cloud.items()}
+        geom = geometry_for_model(
+            model, method, cameras, background, gt_cloud, extent, seed=seed
+        )
+        for key, value in geom.items():
+            setattr(result, key, value)
+
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
         _save_images(save_dir, heldout_image, eval_target.cpu(), heldout_depth)
@@ -225,6 +245,7 @@ def run_benchmark(bench: BenchmarkConfig, log: bool = False) -> list:
                             eval_every=bench.eval_every,
                             log=log,
                             save_dir=save_dir if bench.save_images else None,
+                            compute_geometry=bench.compute_geometry,
                         )
                         record = result.to_dict()
                         records.append(record)

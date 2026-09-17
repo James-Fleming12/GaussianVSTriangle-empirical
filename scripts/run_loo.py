@@ -32,6 +32,9 @@ SCENE_DESCRIPTIONS = {
     "sphere": "curved surface + specular highlight",
     "corner": "room corner (sharp edges / occlusion)",
     "sheets": "thin disconnected sheets",
+    "intersect": "three mutually intersecting sheets (depth-order stress)",
+    "hf": "high-frequency textured plane (aliasing / resolution stress)",
+    "solid": "textureless geometry (sphere over floor)",
 }
 
 
@@ -64,6 +67,7 @@ def parse_args(argv=None):
     p.add_argument("--output", default="results/main")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--no-images", action="store_true")
+    p.add_argument("--compute-geometry", action="store_true", help="also evaluate Chamfer/F-score/normals")
     p.add_argument("--quick", action="store_true", help="tiny configuration for a smoke run")
     return p.parse_args(argv)
 
@@ -119,6 +123,7 @@ def main(argv=None):
         device=args.device,
         eval_every=args.eval_every,
         save_images=not args.no_images,
+        compute_geometry=args.compute_geometry,
     )
     print(f"benchmark: {len(specs)} scene(s) x {len(methods)} method(s) x "
           f"{len(folds) if folds else args.views} fold(s); {args.iterations} iters, "

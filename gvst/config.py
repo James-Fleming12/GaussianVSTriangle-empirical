@@ -19,6 +19,7 @@ class TrainConfig:
     iterations: int = 3_000
     seed: int = 0
     sh_degree: int = 2
+    collect_diagnostics: bool = True
 
     # ---- shared photometric loss ----
     lambda_dssim: float = 0.2  # 3DGS Eq. (7)
@@ -68,6 +69,9 @@ class TrainConfig:
     tri_densify_until_iter: int = 25_000
     tri_densification_interval: int = 500
     tri_growth: float = 1.3
+    # densification mechanism: "mcmc" (paper), "deterministic" (top-importance
+    # selection, same split/clone geometry) or "none" (ablation).
+    tri_densify_mode: str = "mcmc"
     tri_opacity_dead: float = 0.014
     tri_importance_threshold: float = 0.022
     tri_split_size: float = 24.0
@@ -145,3 +149,4 @@ class BenchmarkConfig:
     device: str = "cuda"
     eval_every: int = 200
     save_images: bool = True
+    compute_geometry: bool = False

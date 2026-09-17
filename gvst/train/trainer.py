@@ -100,6 +100,7 @@ class Trainer:
         self.model.to(self.device)
         self.model.train()
         self.model.setup_optimizer(cfg)
+        self.model._reset_diagnostics()
 
         if train_targets is None:
             train_targets = [None] * len(train_cameras)  # type: ignore[list-item]
@@ -129,6 +130,7 @@ class Trainer:
             )
             loss = self._loss(out, gt, camera, iteration)
             loss.backward()
+            self.model.record_step_stats(out)
             self.model.accumulate_densification_stats(out)
 
             if self.model.optimizer is not None:
@@ -183,6 +185,13 @@ class Trainer:
             m = evaluate(t_out.image, train_targets[i])
             t_psnr.append(m["psnr"])
             t_ssim.append(m["ssim"])
+        diag = self.model.diagnostics()
+        if diag and train_cameras and getattr(self.cfg, "collect_diagnostics", False):
+            # a single-view coverage snapshot, available for every method (3DGS
+            # does not otherwise materialise per-pixel weights during training)
+            cov_out = self._evaluate(train_cameras[0], need_weights=True)
+            if cov_out.weights is not None and cov_out.weights.shape[0] > 0:
+                diag["coverage_frac"] = float((cov_out.weights.max(dim=1).values > 1e-5).float().mean())
         entry = {
             "iteration": iteration,
             "loss": loss,
@@ -190,6 +199,8 @@ class Trainer:
             "train_ssim": float(sum(t_ssim) / len(t_ssim)),
             "n_primitives": int(self.model.num_primitives),
         }
+        if diag:
+            entry["diagnostics"] = diag
         if eval_camera is not None and eval_target is not None:
             e_out = self._evaluate(eval_camera, need_weights=False)
             e_metrics = evaluate(e_out.image, eval_target)
